@@ -330,6 +330,142 @@ def clean_text(text: str, max_len: int = 4000) -> str:
     return re.sub(r"\s+", " ", text or "").strip()[:max_len]
 
 
+def detect_product_category(product: ProductData, facts: Optional[Dict[str, Any]] = None) -> str:
+    """
+    상품명 / product_type / tags / handle / 기존 설명을 기준으로
+    상세페이지 섹션 구조를 분기하기 위한 상품군을 보수적으로 판정합니다.
+    """
+    parts = [
+        product.title or "",
+        product.product_type or "",
+        " ".join(product.tags or []),
+        product.handle or "",
+    ]
+
+    if facts:
+        parts.append(json.dumps(facts.get("options", {}), ensure_ascii=False))
+        parts.append(str(facts.get("description_facts", {}).get("visible_text", ""))[:1200])
+
+    text = " ".join(parts).lower()
+
+    if re.search(r"sock|socks|ソックス|靴下|くつ下|くつした|レッグ|タイツ|ストッキング", text):
+        return "ソックス"
+    if re.search(r"hat|cap|ハット|帽子|キャップ|バケットハット|サンバイザー|uv|日よけ|日除け", text):
+        return "帽子"
+    if re.search(r"pouch|ポーチ|化粧ポーチ|メイクポーチ|ケース|小物入れ", text):
+        return "ポーチ"
+    if re.search(r"bag|バッグ|カバン|鞄|ショルダー|クロスボディ|リュック|バックパック|トート|ボストン|巾着|サッチェル", text):
+        return "バッグ"
+    if re.search(r"hair|ヘア|アクセサリー|ピン|クリップ|シュシュ|カチューシャ|ヘアゴム|ヘアピン", text):
+        return "アクセサリー"
+
+    return "その他"
+
+
+def category_defaults(category: str) -> Dict[str, Any]:
+    """
+    OpenAIが失敗した場合や古いJSON形式が返った場合に使うカテゴリ別の安全な初期値。
+    ここで「必要なものがすっきり入る」を全商品共通にしない。
+    """
+    defaults = {
+        "バッグ": {
+            "main_section_title": "必要なものを持ち歩きやすい",
+            "main_section_body": "スマホや財布など、外出時に持ち歩きたい小物をまとめやすいアイテムです。",
+            "scene_points": ["近所へのお出かけ", "通勤・通学", "休日のショッピング", "旅行中のサブバッグ"],
+            "why_points": ["日常使いしやすいデザイン", "コーディネートに合わせやすい", "お出かけに使いやすいサイズ感", "日本のお客様向けに送料無料でお届け"],
+            "style_section_title": "どんなコーデにも合わせやすい",
+            "color_section_title": "カラーバリエーション",
+        },
+        "ポーチ": {
+            "main_section_title": "小物をすっきり整理",
+            "main_section_body": "メイク用品や小物類をまとめたい時に使いやすいポーチです。",
+            "scene_points": ["バッグの中の整理", "旅行用ポーチ", "メイク用品の収納", "デスク周りの小物整理"],
+            "why_points": ["小物を整理しやすい", "持ち歩きやすいサイズ感", "日常使いしやすいデザイン", "日本のお客様向けに送料無料でお届け"],
+            "style_section_title": "バッグの中にもなじみやすい",
+            "color_section_title": "カラーバリエーション",
+        },
+        "ソックス": {
+            "main_section_title": "足元に取り入れやすいデザイン",
+            "main_section_body": "毎日のコーディネートに合わせやすく、足元の印象をさりげなく変えたい時におすすめです。",
+            "scene_points": ["普段のお出かけ", "カジュアルコーデ", "スニーカー合わせ", "季節の足元コーデ"],
+            "why_points": ["足元のアクセントに使いやすい", "デイリーコーデに合わせやすい", "色違いで選びやすい", "日本のお客様向けに送料無料でお届け"],
+            "style_section_title": "足元コーデに合わせやすい",
+            "color_section_title": "カラー・デザイン",
+        },
+        "帽子": {
+            "main_section_title": "日差しが気になる日のお出かけに",
+            "main_section_body": "外出時の日差し対策や、コーディネートのアクセントとして取り入れやすい帽子です。",
+            "scene_points": ["近所へのお出かけ", "旅行や散歩", "屋外イベント", "カジュアルコーデ"],
+            "why_points": ["日差しが気になる日に使いやすい", "外出時に取り入れやすい", "コーディネートに合わせやすい", "日本のお客様向けに送料無料でお届け"],
+            "style_section_title": "外出コーデに合わせやすい",
+            "color_section_title": "カラーバリエーション",
+        },
+        "アクセサリー": {
+            "main_section_title": "さりげなく印象を変えるアクセント",
+            "main_section_body": "いつものスタイルに取り入れやすく、手軽に雰囲気を変えたい時におすすめです。",
+            "scene_points": ["毎日のヘアアレンジ", "お出かけ前の身支度", "カジュアルスタイル", "ギフトにも"],
+            "why_points": ["手軽に使いやすい", "コーディネートのアクセントになる", "日常使いしやすい", "日本のお客様向けに送料無料でお届け"],
+            "style_section_title": "いつものスタイルに合わせやすい",
+            "color_section_title": "デザイン・カラー",
+        },
+        "その他": {
+            "main_section_title": "毎日に取り入れやすいアイテム",
+            "main_section_body": "日常のコーディネートやお出かけに取り入れやすい、使いやすさを意識したアイテムです。",
+            "scene_points": ["普段のお出かけ", "休日のコーディネート", "旅行や外出", "ギフトにも"],
+            "why_points": ["日常使いしやすい", "シンプルで合わせやすい", "幅広いシーンで使いやすい", "日本のお客様向けに送料無料でお届け"],
+            "style_section_title": "コーディネートに合わせやすい",
+            "color_section_title": "バリエーション",
+        },
+    }
+    return defaults.get(category, defaults["その他"])
+
+
+def normalize_ai_copy(copy: Dict[str, Any], product: ProductData, facts: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    OpenAIレスポンスと旧形式JSONの互換性を吸収します。
+    - 旧: storage_text
+    - 新: main_section_title / main_section_body
+    """
+    category = copy.get("detected_category") or facts.get("detected_category") or detect_product_category(product, facts)
+    defaults = category_defaults(category)
+    regex = facts.get("description_facts", {}).get("regex_specs", {}) or {}
+    colors = ", ".join(facts.get("colors_detected") or []) or "商品ページをご確認ください"
+
+    normalized = dict(copy or {})
+    normalized["detected_category"] = category
+    normalized["lead_text"] = normalized.get("lead_text") or f"{product.title}は、日常のコーディネートに取り入れやすい{category}アイテムです。"
+    normalized["why_points"] = normalized.get("why_points") or defaults["why_points"]
+    normalized["main_section_title"] = normalized.get("main_section_title") or defaults["main_section_title"]
+    normalized["main_section_body"] = normalized.get("main_section_body") or normalized.get("storage_text") or defaults["main_section_body"]
+    normalized["scene_points"] = normalized.get("scene_points") or defaults["scene_points"]
+    normalized["style_section_title"] = normalized.get("style_section_title") or defaults["style_section_title"]
+    normalized["style_text"] = normalized.get("style_text") or "主張しすぎないデザインで、日常のスタイルに取り入れやすいアイテムです。"
+    normalized["color_section_title"] = normalized.get("color_section_title") or defaults["color_section_title"]
+    normalized["color_text"] = normalized.get("color_text") or ("カラー情報は商品オプションをご確認ください。" if colors == "商品ページをご確認ください" else colors)
+
+    specs = normalized.get("specs") or {}
+    normalized["specs"] = {
+        "category": specs.get("category") or product.product_type or category,
+        "material": specs.get("material") or regex.get("material") or "商品ページをご確認ください",
+        "size": specs.get("size") or regex.get("size") or "商品ページをご確認ください",
+        "weight": specs.get("weight") or regex.get("weight") or "商品ページをご確認ください",
+        "closure": specs.get("closure") or "商品ページをご確認ください",
+        "pocket": specs.get("pocket") or "商品ページをご確認ください",
+        "colors": specs.get("colors") or colors,
+    }
+
+    faq = normalized.get("faq") or []
+    if len(faq) < 3:
+        faq = faq + [
+            {"q": "普段使いしやすいですか？", "a": "はい。日常のお出かけやコーディネートに取り入れやすいアイテムとしておすすめです。"},
+            {"q": "日本まで配送されますか？", "a": "はい。SOCKSLOVERは日本のお客様向けに運営しており、全商品送料無料でお届けしています。"},
+            {"q": "返品や返金はできますか？", "a": "商品に不良があった場合は、返品・返金ポリシーに基づき対応いたします。"},
+        ]
+    normalized["faq"] = faq[:3]
+
+    return normalized
+
+
 def extract_facts_from_description(description_html: str) -> Dict[str, Any]:
     soup = BeautifulSoup(description_html or "", "html.parser")
     for tag in soup(["script", "style"]):
@@ -381,7 +517,7 @@ def extract_product_facts(product: ProductData, description_facts: Dict[str, Any
             if re.search(r"black|brown|khaki|coffee|white|beige|gray|grey|pink|blue|green|red|yellow|purple|orange|ブラック|ブラウン|カーキ|ホワイト|ベージュ|グレー", tag, re.I):
                 colors.append(tag)
 
-    return {
+    facts = {
         "title": product.title,
         "handle": product.handle,
         "vendor": product.vendor,
@@ -396,6 +532,8 @@ def extract_product_facts(product: ProductData, description_facts: Dict[str, Any
         "product_images": [{"url": img.get("url"), "altText": img.get("altText"), "width": img.get("width"), "height": img.get("height")} for img in product.images[:20]],
         "description_facts": description_facts,
     }
+    facts["detected_category"] = detect_product_category(product, facts)
+    return facts
 
 
 def call_openai_json(api_key: str, model: str, product_facts: Dict[str, Any], language: str = "Japanese") -> Dict[str, Any]:
@@ -408,19 +546,31 @@ def call_openai_json(api_key: str, model: str, product_facts: Dict[str, Any], la
     system = """
 You are a Japanese ecommerce copywriter for SOCKSLOVER.
 Write product page copy ONLY from confirmed facts in the provided JSON.
-Do not invent unconfirmed facts such as exact capacity, waterproofness, durability, weight, material, dimensions, delivery dates, or brand origin.
-If a fact is unknown, write neutral copy or use "商品ページをご確認ください" for spec fields.
-Avoid exaggerated, medical, luxury, official-brand, guaranteed, or misleading claims.
-Output valid JSON only.
+Do not invent unconfirmed facts such as exact capacity, waterproofness, durability, weight, material, dimensions, delivery dates, UV cut rate, medical effects, official certifications, or brand origin.
+If a fact is unknown, write neutral copy or use "商品ページをご確認ください" for spec fields only.
+
+Very important:
+- Generate category-aware copy and section titles.
+- Do NOT use bag/pouch storage titles such as "必要なものがすっきり入る" for socks, hats, hair accessories, or unrelated items.
+- For socks, use a foot/style/wearing-comfort related section title.
+- For hats, use a sun/outdoor/styling related section title.
+- For pouches, storage/organization is acceptable.
+- For bags, carry/storage is acceptable.
+- Avoid "商品ページをご確認ください" in marketing body copy. Use it only in spec fields when truly unknown.
+- Output valid JSON only.
 """
     user = {
         "task": "Generate GMC-safe Japanese Shopify product page copy based only on confirmed product facts.",
         "required_json_schema": {
+            "detected_category": "バッグ | ポーチ | ソックス | 帽子 | アクセサリー | その他",
             "lead_text": "string",
             "why_points": ["4 short bullet strings"],
-            "storage_text": "string",
+            "main_section_title": "category-aware section title. Do not use storage title for socks/hats.",
+            "main_section_body": "string",
             "scene_points": ["4 short scene strings"],
+            "style_section_title": "string",
             "style_text": "string",
+            "color_section_title": "string",
             "color_text": "string",
             "specs": {"category": "string", "material": "string", "size": "string", "weight": "string", "closure": "string", "pocket": "string", "colors": "string"},
             "faq": [{"q": "string", "a": "string"}, {"q": "string", "a": "string"}, {"q": "string", "a": "string"}],
@@ -438,23 +588,38 @@ Output valid JSON only.
 
 
 def fallback_copy(product: ProductData, facts: Dict[str, Any]) -> Dict[str, Any]:
-    regex = facts.get("description_facts", {}).get("regex_specs", {})
+    category = facts.get("detected_category") or detect_product_category(product, facts)
+    defaults = category_defaults(category)
+    regex = facts.get("description_facts", {}).get("regex_specs", {}) or {}
     colors = ", ".join(facts.get("colors_detected") or []) or "商品ページをご確認ください"
-    product_type = product.product_type or "ファッション雑貨"
-    return {
-        "lead_text": f"{product.title}は、日常のコーディネートに取り入れやすい{product_type}です。商品ページで確認できる情報をもとに、使いやすさを重視してご紹介します。",
-        "why_points": ["日常使いしやすいデザイン", "シンプルでコーディネートに合わせやすい", "お出かけや通勤など幅広いシーンで使いやすい", "日本のお客様向けに送料無料でお届け"],
-        "storage_text": "スマホや財布など、普段のお出かけに必要な小物を持ち歩きたい方におすすめです。",
-        "scene_points": ["近所へのお出かけ", "通勤・通学", "休日のショッピング", "旅行中のサブバッグ"],
-        "style_text": "主張しすぎないデザインで、カジュアルからきれいめまで幅広いコーディネートに合わせやすいアイテムです。",
+    product_type = product.product_type or category
+
+    return normalize_ai_copy({
+        "detected_category": category,
+        "lead_text": f"{product.title}は、日常のコーディネートに取り入れやすい{category}アイテムです。確認できる商品情報をもとに、使いやすさを重視してご紹介します。",
+        "why_points": defaults["why_points"],
+        "main_section_title": defaults["main_section_title"],
+        "main_section_body": defaults["main_section_body"],
+        "scene_points": defaults["scene_points"],
+        "style_section_title": defaults["style_section_title"],
+        "style_text": "主張しすぎないデザインで、日常のスタイルに取り入れやすいアイテムです。",
+        "color_section_title": defaults["color_section_title"],
         "color_text": colors if colors != "商品ページをご確認ください" else "カラー情報は商品オプションをご確認ください。",
-        "specs": {"category": product_type, "material": regex.get("material", "商品ページをご確認ください"), "size": regex.get("size", "商品ページをご確認ください"), "weight": regex.get("weight", "商品ページをご確認ください"), "closure": "商品ページをご確認ください", "pocket": "商品ページをご確認ください", "colors": colors},
+        "specs": {
+            "category": product_type,
+            "material": regex.get("material", "商品ページをご確認ください"),
+            "size": regex.get("size", "商品ページをご確認ください"),
+            "weight": regex.get("weight", "商品ページをご確認ください"),
+            "closure": "商品ページをご確認ください",
+            "pocket": "商品ページをご確認ください",
+            "colors": colors,
+        },
         "faq": [
-            {"q": "普段使いしやすいですか？", "a": "はい。日常のお出かけや通勤など、普段使いしやすいアイテムとしておすすめです。"},
+            {"q": "普段使いしやすいですか？", "a": "はい。日常のお出かけやコーディネートに取り入れやすいアイテムとしておすすめです。"},
             {"q": "日本まで配送されますか？", "a": "はい。SOCKSLOVERは日本のお客様向けに運営しており、全商品送料無料でお届けしています。"},
             {"q": "返品や返金はできますか？", "a": "商品に不良があった場合は、返品・返金ポリシーに基づき対応いたします。"},
         ],
-    }
+    }, product, facts)
 
 
 def lines_to_li(items: List[str]) -> str:
@@ -465,7 +630,8 @@ def scene_grid(items: List[str]) -> str:
     return "".join(f"<li style='background:#f8f6f3;border-radius:12px;padding:12px 14px;'>{e(item)}</li>" for item in (items or []) if str(item).strip())
 
 
-def build_sockslover_style_html(product: ProductData, copy: Dict[str, Any], image_html: str, shipping_text: str, return_text: str) -> str:
+def build_sockslover_style_html(product: ProductData, copy: Dict[str, Any], image_html: str, shipping_text: str, return_text: str, facts: Optional[Dict[str, Any]] = None) -> str:
+    copy = normalize_ai_copy(copy or {}, product, facts or {})
     specs = copy.get("specs", {}) or {}
     faq = copy.get("faq", []) or []
     while len(faq) < 3:
@@ -484,19 +650,19 @@ def build_sockslover_style_html(product: ProductData, copy: Dict[str, Any], imag
     <ul style="padding-left:1.2em;margin:0;">{lines_to_li(copy.get("why_points", []))}</ul>
   </section>
   <section style="padding:22px;border:1px solid #eadfd5;border-radius:16px;margin:30px 0;background:#fff;">
-    <h3 style="font-size:20px;margin:0 0 10px;">必要なものがすっきり入る</h3>
-    <p style="margin:0;">{e(copy.get('storage_text'))}</p>
+    <h3 style="font-size:20px;margin:0 0 10px;">{e(copy.get('main_section_title'))}</h3>
+    <p style="margin:0;">{e(copy.get('main_section_body'))}</p>
   </section>
   <section style="margin:30px 0;">
     <h3 style="font-size:20px;margin:0 0 14px;border-bottom:1px solid #e8ded4;padding-bottom:8px;">こんなシーンにおすすめ</h3>
     <ul style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;list-style:none;padding:0;margin:0;">{scene_grid(copy.get("scene_points", []))}</ul>
   </section>
   <section style="padding:22px;background:#f7f2eb;border-radius:16px;margin:30px 0;">
-    <h3 style="font-size:20px;margin:0 0 10px;">どんなコーデにも合わせやすい</h3>
+    <h3 style="font-size:20px;margin:0 0 10px;">{e(copy.get('style_section_title'))}</h3>
     <p style="margin:0;">{e(copy.get('style_text'))}</p>
   </section>
   <section style="margin:30px 0;">
-    <h3 style="font-size:20px;margin:0 0 10px;border-bottom:1px solid #e8ded4;padding-bottom:8px;">カラーバリエーション</h3>
+    <h3 style="font-size:20px;margin:0 0 10px;border-bottom:1px solid #e8ded4;padding-bottom:8px;">{e(copy.get('color_section_title'))}</h3>
     <p style="margin:0;">{e(copy.get('color_text'))}</p>
   </section>
   <section style="margin:34px 0;">
@@ -549,7 +715,7 @@ def render_sidebar():
 
 def main():
     st.title("🛍️ Shopify GMC Optimizer + AI Copy")
-    st.caption("상품 URL을 입력하면 Shopify에서 확인 가능한 데이터만 추출하고, AI가 상품별 일본어 상세페이지 문구를 생성합니다.")
+    st.caption("상품 URL을 입력하면 Shopify에서 확인 가능한 데이터만 추출하고, AI가 상품군별 일본어 상세페이지 문구를 생성합니다.")
 
     store_domain, token, api_version, openai_api_key, openai_model, external_domains = render_sidebar()
 
@@ -587,6 +753,7 @@ def main():
             st.session_state.facts = facts
             st.session_state.ai_copy = None
             st.success(f"상품을 찾았습니다: {product.title}")
+            st.info(f"자동 판정 카테고리: {facts.get('detected_category')}")
         except Exception as err:
             st.error(f"상품 조회 실패: {err}")
             return
@@ -603,6 +770,7 @@ def main():
     with left:
         st.subheader("확인된 Shopify 데이터")
         st.write(f"**Title:** {product.title}")
+        st.write(f"**Detected Category:** {facts.get('detected_category') if facts else '-'}")
         st.write(f"**Product Type:** {product.product_type or '-'}")
         st.write(f"**Vendor:** {product.vendor or '-'}")
         st.write(f"**Tags:** {', '.join(product.tags) if product.tags else '-'}")
@@ -624,7 +792,8 @@ def main():
     if gen_button:
         try:
             with st.spinner("AI가 상품별 상세페이지 문구를 작성하는 중..."):
-                st.session_state.ai_copy = call_openai_json(openai_api_key, openai_model, facts)
+                raw_copy = call_openai_json(openai_api_key, openai_model, facts)
+                st.session_state.ai_copy = normalize_ai_copy(raw_copy, product, facts)
             st.success("AI 문구 생성 완료")
         except Exception as err:
             if use_fallback:
@@ -640,7 +809,7 @@ def main():
             ai_copy_text = st.text_area("JSON 수정", value=json.dumps(st.session_state.ai_copy, ensure_ascii=False, indent=2), height=420)
             if st.button("수정한 JSON 적용"):
                 try:
-                    st.session_state.ai_copy = json.loads(ai_copy_text)
+                    st.session_state.ai_copy = normalize_ai_copy(json.loads(ai_copy_text), product, facts)
                     st.success("수정한 JSON을 적용했습니다.")
                 except Exception as err:
                     st.error(f"JSON 파싱 실패: {err}")
@@ -669,7 +838,7 @@ def main():
                     progress_area=progress_area,
                 )
                 image_html = images_only_html(replaced_html, product.title)
-                new_html = build_sockslover_style_html(product, st.session_state.ai_copy, image_html, shipping_text, return_text)
+                new_html = build_sockslover_style_html(product, st.session_state.ai_copy, image_html, shipping_text, return_text, facts)
 
             st.subheader("이미지 처리 결과")
             if replacements:
