@@ -2,6 +2,8 @@ import os
 import re
 import time
 import json
+import csv
+import io
 import html
 import urllib.parse
 from dataclasses import dataclass
@@ -32,6 +34,7 @@ SHOPIFY_CDN_MARKERS = ["cdn.shopify.com", "shopifycdn.net"]
 REQUEST_CONNECT_TIMEOUT = 20
 REQUEST_READ_TIMEOUT = 150
 DEFAULT_MAX_RETRIES = 6
+OPTIMIZED_MARKER = "SOCKSLOVER_GMC_OPTIMIZED_V2"
 
 
 @dataclass
@@ -695,6 +698,7 @@ def build_sockslover_style_html(product: ProductData, copy: Dict[str, Any], imag
 """.strip()
 
 
+
 def render_sidebar():
     st.sidebar.header("Shopify Settings")
     store_domain = st.sidebar.text_input("Store domain", value=get_secret_or_env("SHOPIFY_STORE_DOMAIN", "sockslover-net.myshopify.com"))
@@ -710,163 +714,354 @@ def render_sidebar():
     st.sidebar.header("Image Detection")
     external_domains_text = st.sidebar.text_area("외부 이미지 도메인 키워드", value="\n".join(DEFAULT_EXTERNAL_DOMAINS), height=160)
     external_domains = [line.strip() for line in external_domains_text.splitlines() if line.strip()]
+
     return normalize_store_domain(store_domain), token.strip(), normalize_api_version(api_version), openai_api_key.strip(), openai_model.strip(), external_domains
 
 
-def main():
-    st.title("🛍️ Shopify GMC Optimizer + AI Copy")
-    st.caption("상품 URL을 입력하면 Shopify에서 확인 가능한 데이터만 추출하고, AI가 상품군별 일본어 상세페이지 문구를 생성합니다.")
+def parse_url_lines(text_value: str, max_urls: int = 20) -> List[str]:
+    urls: List[str] = []
+    for line in (text_value or "").splitlines():
+        value = line.strip()
+        if not value or value.startswith("#"):
+            continue
+        urls.append(value)
+    seen = []
+    for url in urls:
+        if url not in seen:
+            seen.append(url)
+    return seen[:max_urls]
 
-    store_domain, token, api_version, openai_api_key, openai_model, external_domains = render_sidebar()
 
-    with st.expander("사용 전 체크", expanded=False):
-        st.markdown("""
-- Shopify 권한: `read_products`, `write_products`, `read_files`, `write_files`
-- AI 문구 생성에는 `OPENAI_API_KEY`가 필요합니다.
-- AI는 Shopify에서 확인 가능한 데이터만 근거로 작성하도록 제한되어 있습니다.
-- 처음에는 반드시 `Dry Run`으로 테스트하세요.
-        """)
+def result_rows_to_csv(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return ""
+    output = io.StringIO()
+    fieldnames = [
+        "index", "url", "handle", "title", "category", "status", "dry_run",
+        "replaced_images", "skipped_images", "error"
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return output.getvalue()
+
+
+def process_product_url(
+    *,
+    product_url: str,
+    store_domain: str,
+    token: str,
+    api_version: str,
+    openai_api_key: str,
+    openai_model: str,
+    external_domains: List[str],
+    shipping_text: str,
+    return_text: str,
+    dry_run: bool,
+    skip_already_processed: bool,
+    use_fallback: bool,
+    progress_area=None,
+) -> Dict[str, Any]:
+    """Process one product end-to-end. Used by both Single Mode and Batch Mode."""
+    handle = extract_handle_from_product_url(product_url)
+    product = get_product_by_handle(store_domain, token, api_version, handle)
+
+    if skip_already_processed and OPTIMIZED_MARKER in (product.description_html or ""):
+        return {
+            "url": product_url,
+            "handle": product.handle,
+            "title": product.title,
+            "category": "-",
+            "status": "skipped_already_processed",
+            "dry_run": dry_run,
+            "replaced_images": 0,
+            "skipped_images": 0,
+            "error": "",
+            "html": "",
+            "ai_copy": {},
+        }
+
+    desc_facts = extract_facts_from_description(product.description_html)
+    facts = extract_product_facts(product, desc_facts)
+
+    try:
+        raw_copy = call_openai_json(openai_api_key, openai_model, facts)
+        ai_copy = normalize_ai_copy(raw_copy, product, facts)
+        ai_status = "openai"
+    except Exception as err:
+        if not use_fallback:
+            raise
+        ai_copy = fallback_copy(product, facts)
+        ai_status = f"fallback: {err}"
+
+    replaced_html, replacements, skipped = replace_external_images(
+        store_domain=store_domain,
+        token=token,
+        api_version=api_version,
+        description_html=product.description_html,
+        product_url=product_url,
+        external_domains=external_domains,
+        dry_run=dry_run,
+        progress_area=progress_area,
+    )
+
+    image_html = images_only_html(replaced_html, product.title)
+    new_html = build_sockslover_style_html(product, ai_copy, image_html, shipping_text, return_text, facts)
+    new_html = f"<!-- {OPTIMIZED_MARKER} -->\n" + new_html
+
+    if not dry_run:
+        update_product_description(store_domain, token, api_version, product.id, new_html)
+
+    return {
+        "url": product_url,
+        "handle": product.handle,
+        "title": product.title,
+        "category": facts.get("detected_category"),
+        "status": "success",
+        "dry_run": dry_run,
+        "replaced_images": len(replacements),
+        "skipped_images": len(skipped),
+        "error": ai_status if ai_status.startswith("fallback") else "",
+        "html": new_html,
+        "ai_copy": ai_copy,
+        "skipped_logs": skipped,
+    }
+
+
+def render_common_options():
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        dry_run = st.toggle("Dry Run", value=True, help="ON이면 Shopify에 실제 업데이트하지 않습니다.")
+    with col2:
+        skip_already_processed = st.toggle("이미 처리된 상품 스킵", value=True, help=f"Body HTML에 {OPTIMIZED_MARKER} 마커가 있으면 건너뜁니다.")
+    with col3:
+        use_fallback = st.checkbox("OpenAI 실패 시 카테고리별 fallback 문구 사용", value=True)
+
+    st.subheader("배송/반품 공통 문구")
+    shipping_text = st.text_area(
+        "配送説明",
+        value="SOCKSLOVERでは全商品送料無料でお届けしています。ご注文後、通常2〜4営業日以内に発送準備を行い、発送後7〜14営業日前後でお届けします。",
+        height=80,
+    )
+    return_text = st.text_area(
+        "返品・返金説明",
+        value="商品に不良があった場合は、返金または再送にて対応いたします。詳細は返品・返金ポリシーをご確認ください。",
+        height=80,
+    )
+    return dry_run, skip_already_processed, use_fallback, shipping_text, return_text
+
+
+def render_single_mode(store_domain, token, api_version, openai_api_key, openai_model, external_domains):
+    st.header("Single Mode")
+    st.caption("상품 URL 1개를 바로 처리합니다. 테스트나 개별 수정에 사용하세요.")
 
     product_url = st.text_input("Shopify 상품 URL", placeholder="https://sockslover.net/products/...")
-    col1, col2, _ = st.columns([1, 1, 2])
-    with col1:
-        dry_run = st.toggle("Dry Run", value=True)
-    with col2:
-        fetch_button = st.button("상품 불러오기", type="primary")
+    dry_run, skip_already_processed, use_fallback, shipping_text, return_text = render_common_options()
 
-    for key, default in {"product": None, "product_url": "", "facts": None, "ai_copy": None}.items():
-        if key not in st.session_state:
-            st.session_state[key] = default
+    confirm = st.checkbox("이 상품의 Body HTML을 AI 생성 상세페이지 구조로 교체하는 것을 이해했습니다.", value=False)
+    run_button = st.button("Single Dry Run 실행" if dry_run else "Single 실제 업데이트 실행", type="primary", disabled=not confirm)
 
-    if fetch_button:
+    if run_button:
         if not store_domain or not token:
             st.error("Store domain과 Admin API token을 입력해주세요.")
             return
-        try:
-            handle = extract_handle_from_product_url(product_url)
-            with st.spinner("Shopify에서 상품 데이터를 불러오는 중..."):
-                product = get_product_by_handle(store_domain, token, api_version, handle)
-                desc_facts = extract_facts_from_description(product.description_html)
-                facts = extract_product_facts(product, desc_facts)
-            st.session_state.product = product
-            st.session_state.product_url = product_url
-            st.session_state.facts = facts
-            st.session_state.ai_copy = None
-            st.success(f"상품을 찾았습니다: {product.title}")
-            st.info(f"자동 판정 카테고리: {facts.get('detected_category')}")
-        except Exception as err:
-            st.error(f"상품 조회 실패: {err}")
+        if not product_url.strip():
+            st.error("상품 URL을 입력해주세요.")
             return
 
-    product = st.session_state.product
-    facts = st.session_state.facts
-
-    if not product:
-        st.info("먼저 상품 URL을 입력하고 상품을 불러와주세요.")
-        return
-
-    st.divider()
-    left, right = st.columns([1, 1])
-    with left:
-        st.subheader("확인된 Shopify 데이터")
-        st.write(f"**Title:** {product.title}")
-        st.write(f"**Detected Category:** {facts.get('detected_category') if facts else '-'}")
-        st.write(f"**Product Type:** {product.product_type or '-'}")
-        st.write(f"**Vendor:** {product.vendor or '-'}")
-        st.write(f"**Tags:** {', '.join(product.tags) if product.tags else '-'}")
-        st.write(f"**Options:** {json.dumps({o.get('name'): o.get('values') for o in product.options}, ensure_ascii=False)}")
-        st.write(f"**Variants:** {len(product.variants)}")
-        st.write(f"**Product Images:** {len(product.images)}")
-    with right:
-        st.subheader("추출된 사실 데이터")
-        st.json(facts)
-
-    st.divider()
-    st.subheader("AI 문구 생성")
-    gen_col1, gen_col2 = st.columns([1, 2])
-    with gen_col1:
-        gen_button = st.button("AI로 상세 문구 생성", type="primary")
-    with gen_col2:
-        use_fallback = st.checkbox("OpenAI 실패 시 안전한 fallback 문구 사용", value=True)
-
-    if gen_button:
-        try:
-            with st.spinner("AI가 상품별 상세페이지 문구를 작성하는 중..."):
-                raw_copy = call_openai_json(openai_api_key, openai_model, facts)
-                st.session_state.ai_copy = normalize_ai_copy(raw_copy, product, facts)
-            st.success("AI 문구 생성 완료")
-        except Exception as err:
-            if use_fallback:
-                st.warning(f"AI 생성 실패. fallback 문구를 사용합니다: {err}")
-                st.session_state.ai_copy = fallback_copy(product, facts)
-            else:
-                st.error(f"AI 생성 실패: {err}")
-
-    if st.session_state.ai_copy:
-        st.subheader("AI 생성 문구 Preview")
-        st.json(st.session_state.ai_copy)
-        with st.expander("AI 문구 직접 수정"):
-            ai_copy_text = st.text_area("JSON 수정", value=json.dumps(st.session_state.ai_copy, ensure_ascii=False, indent=2), height=420)
-            if st.button("수정한 JSON 적용"):
-                try:
-                    st.session_state.ai_copy = normalize_ai_copy(json.loads(ai_copy_text), product, facts)
-                    st.success("수정한 JSON을 적용했습니다.")
-                except Exception as err:
-                    st.error(f"JSON 파싱 실패: {err}")
-
-    st.divider()
-    st.subheader("배송/반품 공통 문구")
-    shipping_text = st.text_area("配送説明", value="SOCKSLOVERでは全商品送料無料でお届けしています。ご注文後、通常2〜4営業日以内に発送準備を行い、発送後7〜14営業日前後でお届けします。", height=80)
-    return_text = st.text_area("返品・返金説明", value="商品に不良があった場合は、返金または再送にて対応いたします。詳細は返品・返金ポリシーをご確認ください。", height=80)
-
-    st.divider()
-    confirm = st.checkbox("현재 상품의 Body HTML을 AI 생성 상세페이지 구조로 교체하는 것을 이해했습니다.", value=False)
-    run_button = st.button("Dry Run 실행" if dry_run else "실제 업데이트 실행", type="primary", disabled=not confirm or not bool(st.session_state.ai_copy))
-
-    if run_button:
         progress_area = st.empty()
         try:
-            with st.spinner("이미지 CDN 교체 및 HTML 생성 중..."):
-                replaced_html, replacements, skipped = replace_external_images(
+            with st.spinner("상품 처리 중..."):
+                result = process_product_url(
+                    product_url=product_url,
                     store_domain=store_domain,
                     token=token,
                     api_version=api_version,
-                    description_html=product.description_html,
-                    product_url=st.session_state.product_url,
+                    openai_api_key=openai_api_key,
+                    openai_model=openai_model,
                     external_domains=external_domains,
+                    shipping_text=shipping_text,
+                    return_text=return_text,
                     dry_run=dry_run,
+                    skip_already_processed=skip_already_processed,
+                    use_fallback=use_fallback,
                     progress_area=progress_area,
                 )
-                image_html = images_only_html(replaced_html, product.title)
-                new_html = build_sockslover_style_html(product, st.session_state.ai_copy, image_html, shipping_text, return_text, facts)
 
-            st.subheader("이미지 처리 결과")
-            if replacements:
-                st.dataframe([r.__dict__ for r in replacements], use_container_width=True)
-            if skipped:
-                with st.expander(f"스킵/실패 로그 {len(skipped)}개"):
-                    for s in skipped:
-                        st.write("- " + s)
+            if result["status"] == "success":
+                st.success(f"처리 완료: {result['title']}")
+            else:
+                st.info(f"처리 결과: {result['status']}")
 
-            st.subheader("생성된 Body HTML")
-            st.code(new_html, language="html")
-            st.download_button("HTML 다운로드", new_html, file_name=f"{product.handle}_body_html.html", mime="text/html")
+            st.json({k: v for k, v in result.items() if k not in ["html", "ai_copy", "skipped_logs"]})
+
+            if result.get("ai_copy"):
+                with st.expander("AI 생성 문구 보기"):
+                    st.json(result["ai_copy"])
+
+            if result.get("skipped_logs"):
+                with st.expander(f"이미지 스킵/실패 로그 {len(result['skipped_logs'])}개"):
+                    for item in result["skipped_logs"]:
+                        st.write("- " + item)
+
+            if result.get("html"):
+                st.subheader("생성된 Body HTML")
+                st.code(result["html"], language="html")
+                st.download_button(
+                    "HTML 다운로드",
+                    result["html"],
+                    file_name=f"{result['handle']}_body_html.html",
+                    mime="text/html",
+                )
 
             if dry_run:
                 st.info("Dry Run이므로 Shopify에는 반영하지 않았습니다.")
             else:
-                with st.spinner("Shopify 상품 설명 업데이트 중..."):
-                    updated = update_product_description(store_domain, token, api_version, product.id, new_html)
-                st.success("Shopify 상품 설명 업데이트 완료")
-                st.json(updated)
-                refreshed = get_product_by_handle(store_domain, token, api_version, product.handle)
-                st.session_state.product = refreshed
-                st.session_state.facts = extract_product_facts(refreshed, extract_facts_from_description(refreshed.description_html))
+                st.success("Shopify 업데이트가 완료되었습니다.")
+
         except Exception as err:
             st.error(f"실행 실패: {err}")
 
+
+def render_batch_mode(store_domain, token, api_version, openai_api_key, openai_model, external_domains):
+    st.header("Batch Mode")
+    st.caption("상품 URL을 여러 줄로 넣으면 순차적으로 처리합니다. 안정성을 위해 1회 20개 이하를 추천합니다.")
+
+    urls_text = st.text_area(
+        "상품 URL 리스트 / 1줄 1URL",
+        placeholder="https://sockslover.net/products/product-1\nhttps://sockslover.net/products/product-2",
+        height=240,
+    )
+
+    max_urls = st.slider("이번 실행에서 처리할 최대 URL 수", min_value=1, max_value=50, value=20, step=1)
+    sleep_between = st.slider("상품 간 대기 시간 / 초", min_value=0, max_value=15, value=3, step=1)
+
+    dry_run, skip_already_processed, use_fallback, shipping_text, return_text = render_common_options()
+
+    urls = parse_url_lines(urls_text, max_urls=max_urls)
+    st.write(f"처리 대상 URL 수: **{len(urls)}개**")
+
+    if urls:
+        with st.expander("처리 대상 URL 확인"):
+            for i, url in enumerate(urls, start=1):
+                st.write(f"{i}. {url}")
+
+    confirm = st.checkbox("위 URL 리스트를 순차 처리하는 것을 이해했습니다.", value=False)
+    run_batch = st.button("Batch Dry Run 실행" if dry_run else "Batch 실제 업데이트 실행", type="primary", disabled=not confirm or not urls)
+
+    if run_batch:
+        if not store_domain or not token:
+            st.error("Store domain과 Admin API token을 입력해주세요.")
+            return
+
+        results: List[Dict[str, Any]] = []
+        progress_bar = st.progress(0)
+        status_area = st.empty()
+        log_area = st.container()
+
+        for index, url in enumerate(urls, start=1):
+            status_area.info(f"{index}/{len(urls)} 처리 중: {url}")
+            try:
+                result = process_product_url(
+                    product_url=url,
+                    store_domain=store_domain,
+                    token=token,
+                    api_version=api_version,
+                    openai_api_key=openai_api_key,
+                    openai_model=openai_model,
+                    external_domains=external_domains,
+                    shipping_text=shipping_text,
+                    return_text=return_text,
+                    dry_run=dry_run,
+                    skip_already_processed=skip_already_processed,
+                    use_fallback=use_fallback,
+                    progress_area=None,
+                )
+                row = {k: v for k, v in result.items() if k not in ["html", "ai_copy", "skipped_logs"]}
+                row["index"] = index
+                results.append(row)
+                with log_area:
+                    if row["status"] == "success":
+                        st.success(f"{index}. 완료: {row.get('title')} / {row.get('category')} / 이미지 교체 {row.get('replaced_images')}개")
+                    else:
+                        st.info(f"{index}. 스킵: {row.get('title')} / {row.get('status')}")
+
+            except Exception as err:
+                row = {
+                    "index": index,
+                    "url": url,
+                    "handle": "",
+                    "title": "",
+                    "category": "",
+                    "status": "failed",
+                    "dry_run": dry_run,
+                    "replaced_images": 0,
+                    "skipped_images": 0,
+                    "error": str(err),
+                }
+                results.append(row)
+                with log_area:
+                    st.error(f"{index}. 실패: {url} / {err}")
+
+            progress_bar.progress(index / len(urls))
+            if index < len(urls) and sleep_between > 0:
+                time.sleep(sleep_between)
+
+        status_area.success("Batch 처리 완료")
+        st.subheader("Batch 결과")
+        st.dataframe(results, use_container_width=True)
+
+        csv_text = result_rows_to_csv(results)
+        st.download_button(
+            "결과 CSV 다운로드",
+            data=csv_text.encode("utf-8-sig"),
+            file_name="shopify_gmc_batch_results.csv",
+            mime="text/csv",
+        )
+
+        failed = [r for r in results if r.get("status") == "failed"]
+        if failed:
+            retry_urls = "\n".join(r["url"] for r in failed if r.get("url"))
+            st.subheader("실패 URL 재시도용")
+            st.text_area("Failed URLs", value=retry_urls, height=160)
+
+        if dry_run:
+            st.info("Dry Run이므로 Shopify에는 반영하지 않았습니다.")
+        else:
+            st.success("실제 업데이트 Batch가 완료되었습니다.")
+
+
+def main():
+    st.title("🛍️ Shopify GMC Optimizer + Single/Batch AI Copy")
+    st.caption("상품 URL 1개 또는 URL 리스트를 입력해 Shopify CDN 이미지 교체와 카테고리별 AI 상세페이지 생성을 순차 실행합니다.")
+
+    store_domain, token, api_version, openai_api_key, openai_model, external_domains = render_sidebar()
+
+    with st.expander("사용 전 체크", expanded=False):
+        st.markdown(f"""
+- Shopify 권한: `read_products`, `write_products`, `read_files`, `write_files`
+- AI 문구 생성에는 `OPENAI_API_KEY`가 필요합니다.
+- HTML에는 `{OPTIMIZED_MARKER}` 마커를 넣어 재처리를 방지합니다.
+- Batch는 안정성을 위해 10~20개 단위로 실행하는 것을 추천합니다.
+- 처음에는 반드시 `Dry Run`으로 테스트하세요.
+        """)
+
+    mode = st.radio(
+        "처리 모드",
+        ["Single Mode", "Batch Mode"],
+        horizontal=True,
+    )
+
     st.divider()
-    st.caption("Shopify GMC Optimizer + AI Copy / Built for SOCKSLOVER & Ion Labs")
+
+    if mode == "Single Mode":
+        render_single_mode(store_domain, token, api_version, openai_api_key, openai_model, external_domains)
+    else:
+        render_batch_mode(store_domain, token, api_version, openai_api_key, openai_model, external_domains)
+
+    st.divider()
+    st.caption("Shopify GMC Optimizer + Single/Batch AI Copy / Built for SOCKSLOVER & Ion Labs")
 
 
 if __name__ == "__main__":
